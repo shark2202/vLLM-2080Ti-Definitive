@@ -316,3 +316,52 @@ llama-server -m <model.gguf> -ngl 99 -ot '\.ffn_(up|down|gate)_exps\.=CPU' -fa
 ### 9.5 vLLM 侧对比与待验证项
 - vLLM 的权重卸载 `--cpu-offload-gb`（`uva`/`prefetch`）是**按参数**、非专家感知 → 对 dense 代价极大，对 MoE 不如 llama.cpp 成熟；其分层 KV offload 则已验证有效。
 - **待验证（5 分钟可做）**：`vllm-gguf-plugin 0.0.5` 注册了 `qwen3_moe`/`qwen2_moe`。若 `Qwen3.6-35B-A3B` 的 GGUF 架构字段是标准 `qwen3moe`（非混合 GDN），则 vLLM+插件有可能直接加载 10–12GB 的 IQ2 版 35B-A3B，叠加分层 KV offload → 单卡得到"35B 级 + vLLM 并发"。只需 range 读 GGUF 头部确认 `general.architecture`。
+
+---
+
+## 10. 追加：三个 C 引擎的定位、流式 vs 融合，以及"更大模型"的三档结论
+
+### 10.1 三个 C 引擎对照（含本机适配实测）
+| 项目 | 后端 | 机制 | 资源要求 | 速度 | 本机适用 |
+|---|---|---|---|---|---|
+| `kimi-k3-in-c`（第三方） | **纯 CPU，0 GPU** | 1.56 TB 检查点**每 token 从磁盘流式**读一遍 | 磁盘 **~1.7 TB** + 8 GB RAM 起 | 8GB→26.5 s/token；32GB→24.2；64GB→19.8；128GB+→5.6 | ❌ **磁盘不够**（704 GB 可用，差约 1 TB） |
+| `deepseek-v4-in-c`（第三方） | CPU + **可选 `--gpu`** | 同族流式（作者注明 40% 代码移植自 K3）；`--gpu` 只把 **dense trunk（~6.3 GB FP8）**放显存 | Flash 284B ≈ **160 GB 磁盘**；RAM 3.2–18 GB；VRAM ~6.3 GB（Pro 需 ~865 GB，作者未跑） | CPU 2.14–2.21 s/token；`16GB + --gpu` **1.62–1.74 s/token** | ✅ **可装**（160 GB ≤ 704 GB）→ ~0.5–0.6 tok/s |
+| `qwen3.8-27b-in-c`（自研） | 纯 CPU | 权重常驻内存，无流式 | IQ1_M 6.73 GB / Q4_K_M 16.46 GB | 参考机 2.52 / 1.88 tok/s | ✅ 本机 `make strict` 通过，估 1.5–2.5 tok/s |
+
+### 10.2 本机实测：`deepseek-v4-in-c` 的 CUDA 路径可为 SM75 编译
+```bash
+nvcc -arch=sm_75 -c src/cuda/dsv4_cuda.cu     # 退出码 0，产物 54,216 bytes
+```
+原因：其 FP8 kernel **不使用 FP8 张量核**，而是 `d_e4m3()` 软件解码 + `fmaf()` FP32 累加
+（`k_mmq_fp8` / `k_mmq_fp8_n`），因此 Turing 可编译。Makefile 默认 `CUDA_ARCH ?= sm_120`
+（作者目标卡 RTX 5060），但它是 `?=`，可覆盖。
+⇒ 意义：**这是本机第一个"装得下的超 RAM 模型"路线**（284B @ ~0.5 tok/s，GPU 可参与）。
+
+### 10.3 四轴模型（上一节 9.2 的三轴补齐第四轴）
+| 轴 | 机制 | 代价 | 本机适用 |
+|---|---|---|---|
+| ① KV 层 | KV 主体/老块放内存或 SSD | 检索延迟 | ✅ 已在用（KVMem / vLLM 分层 offload，实测 51× TTFT） |
+| ② 权重层·MoE 专家卸载 | 专家放内存，attention+KV 在显存 | 小（只算激活专家） | ✅ 最优（llama.cpp `-cmoe`/`--n-cpu-moe`/`-ot`） |
+| ③ 计算层 | CPU 也参与算子计算 | 中等（同步开销） | ⏳ KTransformers 一类 |
+| ④ **权重层·磁盘流式** | 权重每 token 从磁盘过一遍 | **极大**（秒级/token） | ⚠️ 只在"完全装不下"时成立（deepseek-v4-in-c / colibri） |
+
+### 10.4 上游作者给出的选型表（与我们的结论一致，值得照抄）
+| 你的情况 | 应该用 |
+|---|---|
+| 模型装得进显存或内存 | **llama.cpp**（流式纯属浪费） |
+| 模型装得进**显存+内存之和** | **KTransformers**（CPU/GPU 混合；作者注明 2026-05 起支持 DeepSeek-V4-Flash） |
+| 完全装不下 + 要逐 bit 与参考一致 | `deepseek-v4-in-c` |
+| 完全装不下 + 要更快 | **colibri**（JustVugg/colibri：异步预取 + router lookahead + batch-union 读取 + 多盘条带；纯 C、Apache-2.0） |
+
+### 10.5 本机"跑更大模型"的三档结论
+| 模型规模 | 方案 | 预期 |
+|---|---|---|
+| 35B-A3B（≤21 GiB） | llama.cpp GGUF，全放显存 | **100–300 tok/s**（推算） |
+| DeepSeek-V4-Flash 284B（>48 GiB 组合） | **KTransformers**（专家在内存/GPU 混合） | 待实测，可能 1–3 tok/s |
+| 同上，要纯 C / 逐 bit 一致 | `deepseek-v4-in-c --gpu`（sm_75 已可编）或 colibri | **~0.5–0.6 tok/s** |
+
+### 10.6 未验证与风险
+- `deepseek-v4-in-c` 仅验证 **sm_75 可编译**；**运行时正确性与性能未验证**（作者只在 sm_120 上跑过）。
+  若要走这条路，先用它自带的小样本/自测验证，再考虑 160 GB 下载（按本机实测 ~2 MB/s 约 **22 小时**）。
+- `kimi-k3-in-c` 在本机**无法安装**（磁盘缺约 1 TB），未做任何运行尝试。
+- 三档表中的 100–300 tok/s 与 1–3 tok/s 均为推算值，尚无本机实测。
