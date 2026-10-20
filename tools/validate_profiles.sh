@@ -230,7 +230,9 @@ while IFS= read -r -d '' file; do
 done < <(find "$PROFILE_DIR" -type f -name '*.env' -print0 | sort -z)
 
 if [[ "$PROFILE_DIR" == "$ROOT/profiles" ]]; then
-  mapfile -t actual_profiles < <(find "$PROFILE_DIR" -type f -name '*.env' -printf '%P\n' | sort)
+# profiles/local is the documented place for local routes (update.sh preserves it):
+  # it stays schema-checked by the walk above but must not count against the official matrix.
+  mapfile -t actual_profiles < <(find "$PROFILE_DIR" -type f -name '*.env' -printf '%P\n' | grep -v '^local/' | sort)
   if (( ${#actual_profiles[@]} != ${#expected_profiles[@]} )); then
     profile_error "<profile-matrix>" "expected exactly ${#expected_profiles[@]} official profiles, found ${#actual_profiles[@]}"
   else
