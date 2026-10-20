@@ -225,3 +225,42 @@ GPU_UTIL=0.78 → 约 133K 上下文（vLLM 会拒绝更高 util，这是保护�
 # 4) 并发结论只在同一 capture-size 策略下可比
 launcher 默认 capture_sizes=[1]；要对比"理论上限"需显式放宽（见 .tooling/ab_cudagraph.sh）
 ```
+---
+
+## 8. 追加：GGUF 清单（local-ai-zone）的核对结果与更好的替代路线
+
+数据源：`https://local-ai-zone.github.io/gguf_models.json`（**38,814 条** GGUF 条目，字段含
+`quantFormat` / `fileSize` / `minRamGB` / `huggingFaceLink`）。该文件单流下载会被代理打断，
+用 `.tooling/dl_ranged.sh` 多连接分块可稳定拉全（33.97 MB / 8 块）。
+
+### 8.1 vLLM 能不能用它？——不能，而且阻塞点是**架构**不是量化类型
+实测 `vllm-gguf-plugin`（aliyun PyPI 镜像上有 `0.0.5`，cp310-abi3 可装）：
+- 支持的 GGML 类型**很广**：`IQ1_S/IQ1_M/IQ2_XXS…IQ4_XS/Q2_K/Q3_K/Q4_K_M/Q8_0` 等都在（所以"K-quant 不被支持"这个说法是过时的）；
+- 但代码里**完全没有** `qwen3_5` / `hybrid` / `gdn` / `linear_attention` / `mamba` 的处理 →
+  Qwen3.8 的混合 GDN 线性注意力不被支持。
+⇒ **任何 Qwen3.8 GGUF（即使 5.71 GB 的 IQ1_S 27B）都无法被 vLLM 加载。**
+
+### 8.2 27B 在单卡的最终结论（三条路都不通）
+| 路线 | 结果 |
+|---|---|
+| vLLM 支持的 safetensors 量化 | 最小 18.60 GB（RedHatAI INT4）→ 权重后 KV 余量 ≈ 0 → **不可服务** |
+| GGUF + 官方插件 | 架构不支持（见 8.1） |
+| 权重卸载 `--cpu-offload-gb` | 能塞进显存，但被卸载权重每 token 走 PCIe → 估 decode 5–11 tok/s |
+⇒ 27B 的最优解仍是 llama.cpp（13 GB Q2 mix + KVMem 256K，45–48 tok/s）。
+
+### 8.3 清单带来的**更好路线**：同家族小模型（safetensors，vLLM 原生支持）
+清单里出现 `Qwen3.8 2b/4b Distill`，其 HF safetensors 版本（tags 均含 `qwen3_5`，与已验证的
+9B/27B 同架构，走同一套 SM75 GDN/FlashQLA 路径）：
+
+| 模型 | 体积 | 单卡 KV 余量（util 0.90，扣 2 GiB 激活） | FP8 KV 容量量级 |
+|---|---:|---:|---:|
+| `empero-ai/Qwen3.8-2B-Distill` | 4.57 GB | ~13 GiB | **~800K tokens** → 256K × 3 并发 |
+| `empero-ai/Qwen3.8-4B-Distill` | 9.34 GB | ~8.6 GiB | **~550K tokens** → 256K × 2 并发 |
+
+（实际 KV/token 取决于层数与 full-attention 层数，需按 config.json 核算；9B 实测为 16 KiB/token。）
+⇒ 若目标是"单卡多会话 + 长上下文"，**2B/4B 才是这个设备的甜点区**，而不是 27B。
+
+### 8.4 对 llama.cpp 侧的价值
+清单含 732 条 Qwen3.8-27B 条目，最小者为 `IQ1_S 5.71 GB`、`IQ2_XXS 8.37 GB`、`IQ2_XS 8.75 GB`
+（当前用的是 13.0 GB 的 Q2-LynnStyle 混合配方）。若需要腾出 4.6–7 GB 显存（换更长 KV / 更多
+草稿 / 同卡双模型），这些是可选项，代价是质量下降，需实测对比。
