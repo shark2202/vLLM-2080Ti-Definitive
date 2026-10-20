@@ -264,3 +264,55 @@ launcher 默认 capture_sizes=[1]；要对比"理论上限"需显式放宽（见
 清单含 732 条 Qwen3.8-27B 条目，最小者为 `IQ1_S 5.71 GB`、`IQ2_XXS 8.37 GB`、`IQ2_XS 8.75 GB`
 （当前用的是 13.0 GB 的 Q2-LynnStyle 混合配方）。若需要腾出 4.6–7 GB 显存（换更长 KV / 更多
 草稿 / 同卡双模型），这些是可选项，代价是质量下降，需实测对比。
+
+---
+
+## 9. 追加：CPU 车道与 CPU+GPU 融合（同机实测的工具链核对）
+
+### 9.1 纯 CPU 引擎 `qwen3.8-27b-in-c`（本机适配结论）
+本机 `make strict` **编译通过**（含其自带 HTTP/JSON 与工具调用测试），依赖仅 `AVX2 + 内存`，
+与 CUDA/torch 零耦合；权重由 ModelScope 分发（本机已验证可**直连**），带固定 revision 与 SHA256。
+
+| 项 | 结论 |
+|---|---|
+| 工具链适配 | ✅ 本机 gcc 11.4 与其参考环境一致；`avx2/fma` 具备；单 NUMA 节点（无需绑核） |
+| 预期速度 | IQ1_M 6.73GB → **约 1.5–2.5 tok/s**（估计）；Q4_K_M 16.46GB → 约 1.2–1.8 tok/s（参考机 i5-1340P 为 2.52 / 1.88） |
+| 内存账 | Q4_K_M 峰值 RSS 14.49GiB；本机 31GB 中约 15.8GB 被 ComfyUI/code-server/ToDesk 提交 → 可用 ~27GB，两者可跑 |
+| 定位 | **第三车道**：GPU 被占满时的独立兜底 / 批处理 / 无 GPU 机器移植；**不是** 27B 的主力（同机 llama.cpp GPU 为 45–48 tok/s，差 20–30×） |
+| 落地注意 | 端口避开 8080(llama.cpp)/8100(vLLM)/8188(ComfyUI) → 用 `--server 8190`；MTP 默认关闭（其 README 明确"参考负载下验证成本高于收益"） |
+| 同门更优选择 | `qwen3.8-flash-next-in-c`（131B-A6B 稀疏 / 51B PLE，8GB 下限，参考机 batch ~10 tok/s）——对这种"CPU 跑超大稀疏模型"的场景比 27B dense 版更有价值 |
+
+### 9.2 三层 CPU+GPU 融合（工具支持已在本机二进制核对）
+| 层 | 机制 | 本机支持 | 适用性 |
+|---|---|---|---|
+| ① KV 层 | 算力在 GPU，KV 主体/老块放内存或 SSD | KVMem（已跑通 256K logical）；vLLM `TieringOffloadingSpec`（实测前缀复用 TTFT 51×） | ✅ 性价比最高 |
+| ② **权重层·MoE 专家卸载** | **专家权重放内存，attention + KV 留显存** | llama.cpp 二进制实测支持 `-cmoe/--cpu-moe`、`--n-cpu-moe`、`-ot/--override-tensor`、`--n-gpu-layers`、`--flash-attn`、`--cache-type-k`、`--tensor-split` | ✅ **解锁 >22GB 模型**，且速度损失小（每 token 只激活少数专家） |
+| ③ 计算层 | CPU 也参与算子计算 | 无（需 ktransformers 一类；SM75 支持待验证） | 收益低于 ② |
+
+反例：**dense 模型做权重卸载不划算** —— 18.6GB 的 27B INT4 卸载 3GB，被卸载权重每 token 都要过 PCIe
+→ 估 decode **5–11 tok/s**（PCIe 带宽主导），远低于同机 llama.cpp 的 45–48 tok/s。
+
+### 9.3 融合/全显存能解锁的具体目标（GGUF 体积取自 local-ai-zone 索引实测）
+组合预算：**显存 21.2 GiB（ComfyUI 关闭）+ 内存 27 GiB ≈ 48 GiB**
+
+| 目标 | GGUF 体积 | 放置 | 预期 decode |
+|---|---:|---|---|
+| Qwen3.6-35B-A3B IQ3_S / Q3_K_M | 16.8–17.3 GB | **全显存** | **100–300 tok/s**（仅 3B 激活；理论上限 ~360） |
+| Qwen3.6-35B-A3B Q4_K_M | 22.2 GB | 显存吃紧 → `--n-cpu-moe N` 挪部分专家 | 略降，仍远超 27B dense |
+| Qwen3.8-35B-A3B Distill IQ2_M | 12.3 GB | 全显存且可留大 KV | 同档 |
+| Qwen3.8-Flash-Next 131B-A6B IQ2 档 | ~32–42 GB | **必须融合**（attention/KV 显存 + 专家内存） | 5–20 tok/s（受内存带宽限） |
+⇒ 结论：本卡"用尽"的形态是**稀疏 MoE**（35B-A3B 类），而不是 dense 27B 的更高精度。
+
+### 9.4 命令清单
+```bash
+# A. 全显存（ComfyUI 关闭）
+llama-server -m Qwen3.6-35B-A3B-Q3_K_M.gguf -ngl 99 -fa -c 65536 --cache-type-k q8_0
+# B. 部分融合（ComfyUI 占用显存 / 模型更大）
+llama-server -m <model.gguf> -ngl 99 --n-cpu-moe 12 -fa -c 32768
+# C. 显式张量级放置
+llama-server -m <model.gguf> -ngl 99 -ot '\.ffn_(up|down|gate)_exps\.=CPU' -fa
+```
+
+### 9.5 vLLM 侧对比与待验证项
+- vLLM 的权重卸载 `--cpu-offload-gb`（`uva`/`prefetch`）是**按参数**、非专家感知 → 对 dense 代价极大，对 MoE 不如 llama.cpp 成熟；其分层 KV offload 则已验证有效。
+- **待验证（5 分钟可做）**：`vllm-gguf-plugin 0.0.5` 注册了 `qwen3_moe`/`qwen2_moe`。若 `Qwen3.6-35B-A3B` 的 GGUF 架构字段是标准 `qwen3moe`（非混合 GDN），则 vLLM+插件有可能直接加载 10–12GB 的 IQ2 版 35B-A3B，叠加分层 KV offload → 单卡得到"35B 级 + vLLM 并发"。只需 range 读 GGUF 头部确认 `general.architecture`。
